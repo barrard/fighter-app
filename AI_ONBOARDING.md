@@ -9,13 +9,81 @@ changes safely.
 
 ## Repository Layout
 
+- `shared/` – **Single source of truth** for game constants and character
+  definitions. Both server and client import from here. Contains:
+  - `Characters.js` – BASE_STATS defaults and CHARACTERS array with per-character stats
+  - `gameConstants.js` – Canvas dimensions, floor position, gravity, tick rate
+  - `stateCodec.js` – Encodes/decodes player state for network transmission
+  - `inputFlags.js` – Input bitmask encoding for client→server input batches
 - `fighter-first/` – Node 18+ Express + Socket.IO authoritative game server.
   Handles user cookies, room orchestration, simulation, and state broadcast.
 - `react-fighter/` – Vite/React client with Tailwind/ShadCN UI, Canvas
   renderer, and the prediction/reconciliation game loop.
 
 Both packages have their own `package.json`. Run `npm install` inside each
-folder. Common local dev setup:
+folder. The `shared/` directory has no package.json—it's imported directly.
+
+---
+
+## Shared Module Architecture
+
+The `shared/` directory is the **single source of truth** for game mechanics.
+This eliminates bugs from mismatched constants between server and client.
+
+### Import patterns
+
+**Server (Node.js)** – uses relative paths:
+```javascript
+import { GRAVITY, FLOOR_Y } from "../../shared/gameConstants.js";
+import CHARACTERS, { BASE_STATS } from "../../shared/Characters.js";
+import { encodeGameStatePayload } from "../../shared/stateCodec.js";
+```
+
+**Client (Vite/React)** – uses the `@shared` alias (configured in vite.config.js):
+```javascript
+import { GRAVITY, FLOOR_Y } from "@shared/gameConstants.js";
+import { BASE_STATS } from "@shared/Characters.js";
+import { decodeGameStatePayload } from "@shared/stateCodec.js";
+```
+
+### Key shared files
+
+- **gameConstants.js**: Canvas dimensions (1024×576), floor position, gravity
+  (0.8), server tick rate (60 Hz). True constants that never vary per character.
+
+- **Characters.js**: BASE_STATS object with all character defaults (width,
+  height, movementSpeed, jumpVelocity, attack durations, hitbox dimensions,
+  damage values). CHARACTERS array where each character spreads BASE_STATS
+  and can override specific values. `getCharacterById()` helper.
+
+- **stateCodec.js**: Compact encoding for network transmission. ACTION_FLAGS
+  bitmask for boolean states (isJumping, isCrouching, isPunching, isKicking).
+  Encodes/decodes full game state payloads.
+
+- **inputFlags.js**: INPUT_FLAGS bitmask for client→server input batches
+  (ArrowLeft, ArrowRight, ArrowUp, ArrowDown, KeyZ, KeyX). Encodes key states
+  into a single integer.
+
+### No fallbacks rule
+
+Player objects are populated with all stats at character selection time:
+```javascript
+// server.js in characterSelected handler
+const player = {
+    characterWidth: stats.width,      // Copied directly
+    movementSpeed: stats.movementSpeed,
+    armWidth: stats.armWidth,
+    // ... all stats from character.stats
+};
+```
+
+Code should use `player.movementSpeed` directly, never `player.movementSpeed || 5`.
+This ensures any missing stat is caught immediately rather than silently using
+a default that may not match.
+
+---
+
+Common local dev setup:
 
 ````bash
 cd fighter-first && npm run dev    # starts server on 3000 with CORS to 5173
@@ -44,8 +112,8 @@ Environment variables read by the client:
 
 - routes/users.js provides /users/set-name (persists username in a cookie)
   and /users/current.
-- Character metadata lives in gameConfig/Characters.js and is returned via /
-  api/characters.
+- Character metadata lives in `shared/Characters.js` and is returned via /
+  api/characters. The server imports CHARACTERS from the shared module.
 
 ### Socket event surface
 
@@ -98,28 +166,48 @@ Hz).
 
 ### Player state contract
 
-player objects in gameState.players maps include:
+Player objects in gameState.players maps include all stats from the character
+definition (no fallbacks anywhere). Key fields:
 
 {
-  id, x, height, facing,
+  // Identity & position
+  id, x, height, facing, color,
+
+  // Movement state
   movingDirection, horizontalVelocity,
-  isJumping, verticalVelocity,
-  isPunching, isKicking,
-  batchInput: Array<{ keysPressed, currentTick }>,
-  currentTick, serverTick, lastProcessedInput
+  isJumping, isCrouching, verticalVelocity,
+
+  // Combat state
+  isPunching, isKicking, attackState, hitStun, knockbackVelocity,
+
+  // Character stats (copied from shared/Characters.js at selection time)
+  characterWidth, characterHeight, movementSpeed, jumpVelocity,
+  punchDuration, kickDuration, health, maxHealth,
+  punchDamage, kickDamage, punchKnockback, kickKnockback,
+  punchActiveStart, punchActiveEnd, kickActiveStart, kickActiveEnd,
+
+  // Hitbox dimensions (for combat collision detection)
+  armWidth, armHeight, armYOffset,
+  legWidth, legHeight, legYOffset,
+
+  // Input/tick tracking
+  inputBuffer: { [serverTick]: keyState },
+  currentFrame, serverTick, lastProcessedTick
 }
 
-Important: The server pulls one entry per tick from batchInput. Each entry is
-created on receipt of playerInputBatch as:
+Important: The server pulls one entry per tick from player.inputBuffer, keyed
+by serverTick. Input frames are decoded from bitmasks using `shared/inputFlags.js`.
 
-batchInput.keysPressed.map(keysPressed => ({
-  keysPressed,
-  currentTick: batchInput.currentTick
-}));
+When adding new input controls:
+1. Add to INPUT_FLAGS in `shared/inputFlags.js`
+2. Update InputBatchHandler.keysPressed on the client
+3. Update server's handlePlayerInput() in GameLoopService.js
 
-So keysPressed is the snapshot object from the client
-({ ArrowLeft: bool, ... }). When adding new controls, extend both
-InputBatchHandler.keysPressed and server handlePlayerInput().
+When adding new action states (visible to other players):
+1. Add to ACTION_FLAGS in `shared/stateCodec.js`
+2. Update decodeActionMask/encodeActionMask in stateCodec.js
+3. Add explicit mapping in GameLoopService.js broadcast (the players.map() block)
+4. Handle in client's GameLoop.js for remote player state sync
 
 ### Rooms and lifecycle
 
@@ -136,10 +224,15 @@ InputBatchHandler.keysPressed and server handlePlayerInput().
 
 - The authoritative server never trusts client coordinates. Always recompute
   in updatePlayerState.
-- Keep timing constants (MOVEMENT_SPEED, JUMP_VELOCITY, etc.) mirrored between
-  server’s GameLoopService and client game-engine/contants.js.
-- When introducing new combat actions, update the server’s
-  handlePlayerInput + updatePlayerState and the client’s prediction code
+- **Single source of truth**: All game constants and character stats live in
+  `shared/`. Never duplicate values—import from shared modules instead.
+  - Server uses relative imports: `import { GRAVITY } from "../../shared/gameConstants.js"`
+  - Client uses Vite alias: `import { GRAVITY } from "@shared/gameConstants.js"`
+- **No fallbacks**: Player objects carry all their stats (characterWidth,
+  movementSpeed, armWidth, etc.). Code should use `player.movementSpeed`
+  directly, never `player.movementSpeed || SOME_DEFAULT`.
+- When introducing new combat actions, update the server's
+  handlePlayerInput + updatePlayerState and the client's prediction code
   (simulatePlayerMovementFrame and renderers) in lockstep.
 
 ———
@@ -205,9 +298,11 @@ context/SocketContext.jsx:
 
 - Canvas.js – handles canvas context/resizing, draws initial scene text, keeps
   status DOM node reference.
-- contants.js – single source of physics/dimension values (mirror server
-  values manually).
-- Draw.js – low-level rendering for players, floor, actions, indicator.
+- contants.js – re-exports physics/dimension values from `@shared/gameConstants.js`
+  and adds client-only constants (stick figure proportions, prediction buffer).
+- Draw.js – low-level rendering for players (stick figures), floor, actions,
+  indicator. Uses player properties for dimensions (characterWidth/Height) and
+  hitboxes (armWidth, legWidth, etc.).
 - InputBatchHandler.js
     - Registers keydown/keyup, tracks keysPressed.
     - Every time GameLoop hits its 3-frame cadence it calls sendBatch(),
@@ -257,21 +352,26 @@ context/SocketContext.jsx:
     - Only emit characterSelected once per player per match. Server tracks
       player1Character / player2Character and starts GameLoopService after
       both are present.
-    - Character metadata should stay in sync between fighter-first/gameConfig/
-      Characters.js and react-fighter/src/gameConfig/Characters.js. Prefer
-      fetching from the server list (current code already does this).
+    - Character metadata is defined once in `shared/Characters.js`. Both server
+      and client import from there. Client fetches the list via /api/characters
+      to ensure consistency.
 3. Input batching
-    - Client collects raw key states per rendered frame → pushes to
-      inputsOnDeck.
-    - Every 3 frames, client emits playerInputBatch.
-    - Server flattens each keysPressed object into player.batchInput so that
-      each simulation tick consumes at most one snapshot.
+    - Client collects raw key states per rendered frame → encodes using
+      `shared/inputFlags.js` bitmask → pushes to inputsOnDeck.
+    - Every 3 frames, client emits playerInputBatch (or compact "ib" event).
+    - Server decodes input bitmask and stores in player.inputBuffer keyed by
+      serverTick so each simulation tick consumes at most one snapshot.
     - When modifying key semantics (new buttons, combos), update:
-      InputBatchHandler.keysPressed, GameLoop.updateLocalPlayerGameLoop,
-      GameLoop.simulatePlayerMovementFrame, GameLoopService.handlePlayerInput,
-      and GameLoopService.updatePlayerState.
+      `shared/inputFlags.js`, InputBatchHandler.keysPressed,
+      GameLoop.updateLocalPlayerGameLoop, GameLoop.simulatePlayerMovementFrame,
+      GameLoopService.handlePlayerInput, and GameLoopService.updatePlayerState.
 4. State broadcast
     - Server emits gameState for the entire room; no per-player messages.
+    - State is encoded using `shared/stateCodec.js` (ACTION_FLAGS bitmask for
+      boolean states like isJumping, isCrouching, isPunching, isKicking).
+    - **Critical**: GameLoopService has an explicit property mapping when
+      building the broadcast payload. New action states must be added to this
+      mapping or they won't be transmitted.
     - Client uses reconciliation for the local player and simple snapping/
       interpolation for others. Keep currentTick updated to prevent
       resimulating stale inputs.
@@ -283,26 +383,39 @@ context/SocketContext.jsx:
 
 ## Extending the Game
 
-- Adding a move/combat action
-    1. Define the action flag in both server player state and client drawing
-       logic.
-    2. Capture input on the client (InputBatchHandler, and optionally start/
-       stop timers for animation).
-    3. Set/clear the new flag in GameLoopService.handlePlayerInput and
-       incorporate it into updatePlayerState.
-    4. For prediction, mimic the server logic inside
-       GameLoop.simulatePlayerMovementFrame.
+- Adding a new input key (client→server only, like a special move trigger)
+    1. Add to INPUT_FLAGS bitmask in `shared/inputFlags.js`
+    2. Update InputBatchHandler.keysPressed and encodeInputMask on client
+    3. Update handlePlayerInput() in GameLoopService.js to read the new flag
+
+- Adding a new action state (visible to remote players, like blocking)
+    1. Add to ACTION_FLAGS bitmask in `shared/stateCodec.js`
+    2. Update encodeActionMask/decodeActionMask in stateCodec.js
+    3. Add the property to GameLoopService.js broadcast mapping (the explicit
+       `players.map()` block around line 175)
+    4. Handle in client's GameLoop.js for remote player rendering
+    5. Add rendering logic in Draw.js
+
+- Adding a new character stat
+    1. Add default value to BASE_STATS in `shared/Characters.js`
+    2. Override per-character in the CHARACTERS array if needed
+    3. Server copies all stats to player object in server.js characterSelected
+    4. Use `player.newStat` directly—no fallbacks
+
 - Tweaking physics
-    - Change constants in both fighter-first/services/GameLoopService.js (top-
-      level constants) and react-fighter/src/game-engine/contants.js.
+    - Change constants in `shared/gameConstants.js` (GRAVITY, tick rates)
+    - Change character stats in `shared/Characters.js` (movement, jump, etc.)
+    - Both server and client will pick up changes automatically
     - Verify that the server tick rate (currently 60 loop Hz, 20 broadcast Hz)
-      still divides evenly into the client send cadence (frame % 3).
+      still divides evenly into the client send cadence (frame % 3)
+
 - Room UX
     - Room DTOs are produced by GameRoom.toDto(). If you add lobby metadata
-      (e.g., character names), extend this DTO and update Lobby’s rendering.
+      (e.g., character names), extend this DTO and update Lobby's rendering.
+
 - User identity
     - SocketContext listens for userData and persists the username locally.
-      If you change auth/storage, update server.js’s checkForUsername and the
+      If you change auth/storage, update server.js's checkForUsername and the
       API.js helper.
 
 ———

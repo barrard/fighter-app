@@ -18,6 +18,7 @@ const ACTION_FLAGS = {
     isJumping: 1 << 0,
     isKicking: 1 << 1,
     isPunching: 1 << 2,
+    isCrouching: 1 << 3,
 };
 const STATUS_FLAGS = {
     facingLeft: 1 << 0,
@@ -40,6 +41,7 @@ const decodeActionMask = (mask = 0, target = {}) => {
     target.isJumping = Boolean(mask & ACTION_FLAGS.isJumping);
     target.isKicking = Boolean(mask & ACTION_FLAGS.isKicking);
     target.isPunching = Boolean(mask & ACTION_FLAGS.isPunching);
+    target.isCrouching = Boolean(mask & ACTION_FLAGS.isCrouching);
     return target;
 };
 
