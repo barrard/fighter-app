@@ -1,3 +1,5 @@
+import { isPunch, isKick } from './attackTypes.js';
+
 const PLAYER_FIELD_SHORT = {
     id: "i",
     x: "x",
@@ -16,10 +18,14 @@ const PLAYER_FIELD_LONG = Object.entries(PLAYER_FIELD_SHORT).reduce((acc, [long,
 
 const ACTION_FLAGS = {
     isJumping: 1 << 0,
-    isKicking: 1 << 1,
-    isPunching: 1 << 2,
-    isCrouching: 1 << 3,
+    isCrouching: 1 << 1,
+    // Bits 2-4 reserved for currentAttackType (3 bits = 0-7)
+    // Legacy isKicking/isPunching derived from currentAttackType
 };
+
+// Mask for extracting currentAttackType from bits 2-4
+const ATTACK_TYPE_SHIFT = 2;
+const ATTACK_TYPE_MASK = 0b11100; // bits 2-4
 const STATUS_FLAGS = {
     facingLeft: 1 << 0,
     inHitStun: 1 << 1,
@@ -29,19 +35,28 @@ const toBoolean = (value) => Boolean(value);
 
 const encodeActionMask = (player) => {
     let mask = 0;
-    for (const [prop, bit] of Object.entries(ACTION_FLAGS)) {
-        if (player[prop]) {
-            mask |= bit;
-        }
-    }
+    if (player.isJumping) mask |= ACTION_FLAGS.isJumping;
+    if (player.isCrouching) mask |= ACTION_FLAGS.isCrouching;
+
+    // Encode currentAttackType in bits 2-4
+    const attackType = player.currentAttackType || 0;
+    mask |= (attackType & 0b111) << ATTACK_TYPE_SHIFT;
+
     return mask;
 };
 
 const decodeActionMask = (mask = 0, target = {}) => {
     target.isJumping = Boolean(mask & ACTION_FLAGS.isJumping);
-    target.isKicking = Boolean(mask & ACTION_FLAGS.isKicking);
-    target.isPunching = Boolean(mask & ACTION_FLAGS.isPunching);
     target.isCrouching = Boolean(mask & ACTION_FLAGS.isCrouching);
+
+    // Decode currentAttackType from bits 2-4
+    const attackType = (mask >> ATTACK_TYPE_SHIFT) & 0b111;
+    target.currentAttackType = attackType;
+
+    // Derive legacy isPunching/isKicking from attackType for compatibility
+    target.isPunching = isPunch(attackType);
+    target.isKicking = isKick(attackType);
+
     return target;
 };
 
@@ -69,7 +84,9 @@ export const encodePlayerState = (player = {}) => {
             encoded[shortKey] = player[longKey];
         }
     }
-    const hasActionProps = Object.keys(ACTION_FLAGS).some((key) => player[key] !== undefined);
+    // Check if we have any action-related properties to encode
+    const hasActionProps = Object.keys(ACTION_FLAGS).some((key) => player[key] !== undefined) ||
+        player.currentAttackType !== undefined;
     if (hasActionProps) {
         encoded.a = encodeActionMask(player);
     }

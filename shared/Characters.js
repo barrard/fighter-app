@@ -31,11 +31,21 @@ export const BASE_STATS = {
     punchKnockback: 8,
     kickKnockback: 12,
 
-    // Attack active frames (when hitbox is active)
+    // Attack active frames (when hitbox is active) - legacy, kept for compatibility
     punchActiveStart: 3,
     punchActiveEnd: 8,
     kickActiveStart: 5,
     kickActiveEnd: 12,
+
+    // Directional attack stats
+    attacks: {
+        highPunch: { duration: 250, width: 28, height: 10, yOffset: 15, damage: 8, knockback: 6, activeStart: 2, activeEnd: 6 },
+        midPunch:  { duration: 300, width: 30, height: 10, yOffset: 30, damage: 10, knockback: 8, activeStart: 3, activeEnd: 8 },
+        lowPunch:  { duration: 280, width: 25, height: 10, yOffset: 55, damage: 7, knockback: 5, activeStart: 3, activeEnd: 7 },
+        highKick:  { duration: 450, width: 38, height: 8, yOffset: 10, damage: 18, knockback: 14, activeStart: 6, activeEnd: 14 },
+        midKick:   { duration: 400, width: 35, height: 8, yOffset: 50, damage: 15, knockback: 12, activeStart: 5, activeEnd: 12 },
+        lowKick:   { duration: 350, width: 40, height: 8, yOffset: 85, damage: 12, knockback: 10, activeStart: 4, activeEnd: 10 },
+    },
 };
 
 const createCharacter = (id, name, color, stats = {}) => ({
