@@ -150,6 +150,12 @@ currentTick } | Batched predictive inputs.
 | server → client | gameState | { players: [{ id, x, height, facing,
 velocities, serverTick, lastProcessedInput }] } | Authoritative snapshot (~20
 Hz).
+| server → client | startCountdown | { seconds, holdMs, tickMs, startAt } | Pre-round countdown before game starts.
+| server → client | roundStart | { round, durationSeconds, serverTick, scores } | Round begins; clients resync tick clock to serverTick.
+| server → client | roundTimer | { remainingSeconds, round } | Emitted each second while round is active.
+| server → client | combatHits | [{ attackerId, targetId, attackType, damage, targetNewHealth, knockback, tick }] | Server-confirmed hit events.
+| server → client | roundEnd | { round, reason, winnerId, outcome, remainingSeconds, players, scores, matchOver } | Round concluded by health or timer.
+| server → client | matchEnd | { winnerId, scores } | Match concluded (best-of reached).
 
 ### Simulation loop
 
@@ -234,6 +240,66 @@ When adding new action states (visible to other players):
 - When introducing new combat actions, update the server's
   handlePlayerInput + updatePlayerState and the client's prediction code
   (simulatePlayerMovementFrame and renderers) in lockstep.
+- **Monotonic serverTick**: `serverTick` never resets between rounds within a
+  match — only on a true rematch. `GameLoopService.start()` recalibrates
+  `matchStartTime` on round 2+ so the wall-clock formula
+  `floor((now - matchStartTime) * TICK_RATE / 1000)` continues seamlessly
+  from the current `serverTick`. Use `resetForNewMatch()` (called by
+  `resetMatchForRematch()`) to zero the counter for a brand-new match.
+- **Tick budget cap**: `tick()` will never process more than 4 ticks per
+  interval. If the server falls behind under load, excess ticks are skipped
+  by advancing `serverTick` rather than processing a burst. This prevents
+  runaway catch-up spikes.
+
+### Round and match lifecycle
+
+```
+Both players select characters
+  → server: startCalibration() — 3 latency probes (500 ms apart)
+  → clients ack probes → startCountdown() → 3-second UI countdown
+  → server: startGame() → gameLoopService.start() [first start only]
+  → server: startRound() → emits roundStart { round, serverTick, scores }
+  → clients: applyRoundStart() reanchors tick clock; clears inputsOnDeck
+
+Per-round:
+  → server: roundActive = true, roundStartTick = serverTick
+  → health reaches 0 or timer expires → signalRoundEnd()
+  → server: emits roundEnd { winnerId, scores, matchOver }
+  → server: gameLoopService.stop() + gameStarted = false
+
+Between rounds (both players re-ready):
+  → clients send latencyPong → startCountdown() → startGame()
+  → gameLoopService.start() [recalibrates matchStartTime; serverTick continues]
+  → startRound() → emits roundStart with new serverTick
+
+Match over (best-of reached):
+  → server: emits matchEnd { winnerId, scores }
+
+Rematch:
+  → both players vote → resetMatchForRematch()
+  → gameLoopService.resetForNewMatch() [zeros serverTick, nulls matchStartTime]
+  → startCalibration() → full flow restarts from scratch
+```
+
+The key invariant: **`serverTick` is monotonic within a match**. The round
+timer uses `serverTick - roundStartTick` so it always counts forward correctly
+regardless of how many rounds have been played.
+
+### Combat system
+
+Hit detection is fully server-authoritative. Clients show attack animations
+immediately but wait for the `combatHits` event to apply damage.
+
+- `handlePlayerInput()` in GameLoopService sets `player.attackState` when an
+  attack input arrives.
+- `processCombat()` (called each tick after player updates) checks active
+  frames, runs AABB collision via `checkAttackCollision`, applies damage and
+  knockback via `applyHit`, and emits `combatHits`.
+- `attackState.hasHit = true` prevents multi-hit per swing.
+- `hitStun > 0` blocks movement and new attacks on the target; `knockbackVelocity`
+  decays at 0.8x per tick.
+- Health and hitStun are included in the `gs` broadcast so clients always
+  have the authoritative values.
 
 ———
 
@@ -288,16 +354,38 @@ context/SocketContext.jsx:
 
 ### Fight experience (components/FightCanvas.jsx)
 
-- Creates LatencyMonitor, Canvas, InputBatchHandler, and GameLoop instances
-  once socket + <canvas> ref exist.
+- Calls `useGameEngine` to manage the Canvas, InputBatchHandler, and GameLoop
+  lifecycle (see Game engine modules below).
 - Passes allPlayers (the shared map) and localPlayerId (socket.id) into the
   engine.
-- Cleans up by calling gameLoop.stop() on unmount.
+- Renders the HUD (health bars, timer, round score) above the canvas.
+- Handles match-end overlay (rematch / quit buttons).
+
+### Training Grounds (pages/TrainingGrounds.jsx)
+
+- Local single-player preview that runs the **same** game engine as a real
+  multiplayer fight.
+- Loads the first character from `/api/characters`, populates `allPlayers`
+  with a single local player, then calls `useGameEngine` with `localOnly: true`.
+- `localOnly` mode delays game loop creation until `matchStartData` is set
+  (after the fetch), so the player is already in `allPlayers` and
+  `isMatchStarted` is true from frame one — no warm-up delay.
+- Inputs are never sent to the server (`sendBatch` is a no-op); the game loop
+  runs purely client-side with full prediction physics.
 
 ### Game engine modules (src/game-engine/*)
 
-- Canvas.js – handles canvas context/resizing, draws initial scene text, keeps
-  status DOM node reference.
+- **useGameEngine.js** – React hook that owns the full engine lifecycle
+  (InputBatchHandler + Canvas + GameLoop). Both FightCanvas and TrainingGrounds
+  call this hook. Accepts a `localOnly` flag:
+  - `localOnly: false` (server mode): creates the game loop as soon as socket +
+    canvas are ready; handles `matchStartData` updates via a separate effect.
+  - `localOnly: true` (training mode): delays game loop creation until
+    `matchStartData` is non-null, ensuring `allPlayers` is populated and
+    `isMatchStarted` is true from frame one. Also overrides `sendBatch` to a
+    no-op so no inputs are sent to the server.
+- Canvas.js – handles canvas context, draws initial scene text, keeps a status
+  reference (falls back to a dummy object if no `#status` DOM element exists).
 - contants.js – re-exports physics/dimension values from `@shared/gameConstants.js`
   and adds client-only constants (stick figure proportions, prediction buffer).
 - Draw.js – low-level rendering for players (stick figures), floor, actions,
@@ -307,8 +395,7 @@ context/SocketContext.jsx:
     - Registers keydown/keyup, tracks keysPressed.
     - Every time GameLoop hits its 3-frame cadence it calls sendBatch(),
       emitting { keysPressed: [...inputsOnDeck], currentTick }.
-    - Also maintains sentInputWithTicks, which is later used for
-      reconciliation.
+    - Also maintains inputHistory, which is used for reconciliation.
 - GameLoop.js
     - Owns client prediction: runs its own animation frame loop (only one
       instance to avoid double rendering).
@@ -316,15 +403,14 @@ context/SocketContext.jsx:
       uses simulatePlayerMovementFrame() to replay them whenever a server
       snapshot arrives.
     - handleServerUpdateLocalPlayer() applies authoritative state,
-      finds matching tick in sentInputWithTicks, removes processed
-      inputs, re-simulates the remainder, and calculates a correction
-      (localX_Correction) to smoothly interpolate toward the authoritative
-      position. See "Client-Side Prediction & Reconciliation Deep Dive" below.
-    - Remote players simply follow the latest snapshot (targetX,
-      targetHeight). Interpolation hooks are present but currently set to snap
-      to the latest target.
-    - Sends input batches + advances ticks every 3 frames; mirrors the
-      server's 3-tick broadcast cadence.
+      finds matching tick in inputHistory, re-simulates unprocessed inputs,
+      and calculates a correction (localX_Adjustment) to smoothly interpolate
+      toward the authoritative position. See "Client-Side Prediction &
+      Reconciliation Deep Dive" below.
+    - Remote players are lerp-interpolated between server snapshots using
+      prevX/targetX and a SNAPSHOT_INTERVAL_MS window.
+    - Sends input batches every 3 frames; mirrors the server's 3-tick
+      broadcast cadence.
 - LatencyMonitor.js – continuously emits ping, listens to pong, writes a HUD
   overlay to DOM with current/min/max latency and tick count.
 
@@ -392,7 +478,7 @@ context/SocketContext.jsx:
     1. Add to ACTION_FLAGS bitmask in `shared/stateCodec.js`
     2. Update encodeActionMask/decodeActionMask in stateCodec.js
     3. Add the property to GameLoopService.js broadcast mapping (the explicit
-       `players.map()` block around line 175)
+       `players.map()` block in tick())
     4. Handle in client's GameLoop.js for remote player rendering
     5. Add rendering logic in Draw.js
 
@@ -402,12 +488,31 @@ context/SocketContext.jsx:
     3. Server copies all stats to player object in server.js characterSelected
     4. Use `player.newStat` directly—no fallbacks
 
+- Adding a new attack type
+    1. Add to ATTACK_TYPES in `shared/attackTypes.js`
+    2. Add stats (damage, knockback, activeStart, activeEnd, width, height,
+       yOffset, duration) to BASE_STATS.attacks in `shared/Characters.js`
+    3. Update InputBatchHandler.handleActionDown() on the client
+    4. Add rendering in Draw.js (DrawAttack switch or new branch)
+    5. The server's processCombat/isAttackActive/getAttackHitbox will pick up
+       the new type automatically via the attacks stats object
+
 - Tweaking physics
     - Change constants in `shared/gameConstants.js` (GRAVITY, tick rates)
     - Change character stats in `shared/Characters.js` (movement, jump, etc.)
     - Both server and client will pick up changes automatically
     - Verify that the server tick rate (currently 60 loop Hz, 20 broadcast Hz)
       still divides evenly into the client send cadence (frame % 3)
+
+- Tweaking the tick budget / load tolerance
+    - `MAX_CATCHUP_TICKS` in GameLoopService.tick() (default 4). Raise it if
+      you want more catch-up headroom on powerful hardware; lower it to shed
+      load faster on constrained servers.
+
+- Round UX / duration
+    - `roundDurationSeconds` is set in GameRoom constructor (default 99).
+    - `bestOf` controls match length (default 3).
+    - `countdownSeconds` controls the pre-round countdown (default 3).
 
 - Room UX
     - Room DTOs are produced by GameRoom.toDto(). If you add lobby metadata
