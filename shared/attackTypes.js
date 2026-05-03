@@ -9,6 +9,7 @@ export const ATTACK_TYPES = {
     HIGH_KICK: 4,
     MID_KICK: 5,
     LOW_KICK: 6,
+    RANGED: 7,
 };
 
 export const ATTACK_TYPE_NAMES = {
@@ -18,9 +19,11 @@ export const ATTACK_TYPE_NAMES = {
     [ATTACK_TYPES.HIGH_KICK]: 'highKick',
     [ATTACK_TYPES.MID_KICK]: 'midKick',
     [ATTACK_TYPES.LOW_KICK]: 'lowKick',
+    [ATTACK_TYPES.RANGED]: 'ranged',
 };
 
 export const isPunch = (type) => type >= ATTACK_TYPES.HIGH_PUNCH && type <= ATTACK_TYPES.LOW_PUNCH;
 export const isKick = (type) => type >= ATTACK_TYPES.HIGH_KICK && type <= ATTACK_TYPES.LOW_KICK;
+export const isRanged = (type) => type === ATTACK_TYPES.RANGED;
 
 export const getAttackTypeName = (type) => ATTACK_TYPE_NAMES[type] || null;

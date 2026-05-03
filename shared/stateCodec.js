@@ -9,6 +9,9 @@ const PLAYER_FIELD_SHORT = {
     horizontalVelocity: "hv",
     serverTick: "ts",
     health: "hp",
+    attackStartTick: "at",
+    projectileSpawnX: "px",
+    projectileSpawnHeight: "ph",
 };
 
 const PLAYER_FIELD_LONG = Object.entries(PLAYER_FIELD_SHORT).reduce((acc, [long, short]) => {
