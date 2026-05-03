@@ -11,10 +11,13 @@ changes safely.
 
 - `shared/` – **Single source of truth** for game constants and character
   definitions. Both server and client import from here. Contains:
-  - `Characters.js` – BASE_STATS defaults and CHARACTERS array with per-character stats
+  - `Characters.js` – BASE_STATS defaults and 6-fighter CHARACTERS roster with per-character stats, visual metadata, and optional ranged attack config
   - `gameConstants.js` – Canvas dimensions, floor position, gravity, tick rate
   - `stateCodec.js` – Encodes/decodes player state for network transmission
   - `inputFlags.js` – Input bitmask encoding for client→server input batches
+  - `attackTypes.js` – Enumerates melee plus ranged attack types
+  - `comboSystem.js` – Shared forward-forward-X combo detection helpers
+  - `projectileSim.js` – Shared deterministic projectile startup/spawn/flight math
 - `fighter-first/` – Node 18+ Express + Socket.IO authoritative game server.
   Handles user cookies, room orchestration, simulation, and state broadcast.
 - `react-fighter/` – Vite/React client with Tailwind/ShadCN UI, Canvas
@@ -53,16 +56,30 @@ import { decodeGameStatePayload } from "@shared/stateCodec.js";
 
 - **Characters.js**: BASE_STATS object with all character defaults (width,
   height, movementSpeed, jumpVelocity, attack durations, hitbox dimensions,
-  damage values). CHARACTERS array where each character spreads BASE_STATS
-  and can override specific values. `getCharacterById()` helper.
+  damage values). CHARACTERS array currently contains a 6-fighter roster:
+  Knight, Mage, Archer, Rogue, Berserker, Monk. Each fighter spreads
+  BASE_STATS and can override combat stats, `visual`, and `rangedAttack`.
+  `getCharacterById()` helper.
 
 - **stateCodec.js**: Compact encoding for network transmission. ACTION_FLAGS
-  bitmask for boolean states (isJumping, isCrouching, isPunching, isKicking).
-  Encodes/decodes full game state payloads.
+  bitmask for boolean states (isJumping, isCrouching, attack type). Also
+  carries combat timing metadata such as `attackStartTick` and projectile
+  spawn origin for deterministic ranged playback. Encodes/decodes full game
+  state payloads.
 
 - **inputFlags.js**: INPUT_FLAGS bitmask for client→server input batches
   (ArrowLeft, ArrowRight, ArrowUp, ArrowDown, KeyZ, KeyX). Encodes key states
   into a single integer.
+
+- **comboSystem.js**: Shared helper for the universal ranged command:
+  `forward, forward, X`. It tracks forward tap windows in ticks and exposes
+  a small state machine so client prediction and server authority use the
+  same combo recognition rules.
+
+- **projectileSim.js**: Shared deterministic projectile math. Given
+  `attackStartTick`, startup frames, projectile speed, facing, and spawn
+  origin, both server and client can derive spawn timing and current
+  projectile position without streaming projectile position every tick.
 
 ### No fallbacks rule
 
@@ -80,6 +97,53 @@ const player = {
 Code should use `player.movementSpeed` directly, never `player.movementSpeed || 5`.
 This ensures any missing stat is caught immediately rather than silently using
 a default that may not match.
+
+### Character and visual schema
+
+Character definitions now carry three categories of data:
+
+```javascript
+{
+  id,
+  name,
+  color,
+  stats: {
+    // base dimensions + combat numbers
+    movementSpeed,
+    jumpVelocity,
+    health,
+    attacks: { ... },
+
+    // optional ranged move
+    rangedAttack: {
+      startupFrames,
+      projectileSpeed,
+      maxTravelFrames,
+      width, height,
+      yOffset, xOffset,
+      damage, knockback,
+      effect, projectileColor,
+    },
+
+    // procedural rendering metadata
+    visual: {
+      headShape,
+      bodyShape,
+      shoulderScale,
+      hipScale,
+      accentColor,
+      secondaryColor,
+      hairStyle,
+      accessory,
+      weapon,
+    },
+  }
+}
+```
+
+This visual schema is intentionally asset-agnostic. It improves the current
+canvas fighters immediately, but also provides a stable per-character identity
+layer that can later drive sprite sheet or more authored 2D art.
 
 ---
 
@@ -148,8 +212,8 @@ both chars locked in.
 | client → server | playerInputBatch | { keysPressed: Array<keyState>,
 currentTick } | Batched predictive inputs.
 | server → client | gameState | { players: [{ id, x, height, facing,
-velocities, serverTick, lastProcessedInput }] } | Authoritative snapshot (~20
-Hz).
+velocities, serverTick, lastProcessedInput, attackStartTick, projectile spawn
+metadata }] } | Authoritative snapshot (~20 Hz).
 | server → client | startCountdown | { seconds, holdMs, tickMs, startAt } | Pre-round countdown before game starts.
 | server → client | roundStart | { round, durationSeconds, serverTick, scores } | Round begins; clients resync tick clock to serverTick.
 | server → client | roundTimer | { remainingSeconds, round } | Emitted each second while round is active.
@@ -170,6 +234,26 @@ Hz).
     3. Every 3 ticks (tickDiff == 3) it emits gameState to the room (~20 FPS).
     4. Logs perf stats every perfWindow ticks.
 
+### Ranged attack model
+
+Ranged moves are no longer modeled as "instant long melee hitboxes." The
+current design is:
+
+1. Client detects `forward, forward, X` locally for responsive windup.
+2. Server re-detects the same combo from per-tick input history and
+   authoritatively decides whether the kick input upgrades into
+   `ATTACK_TYPES.RANGED`.
+3. Server records `attackStartTick`, `projectileSpawnX`, and
+   `projectileSpawnHeight`.
+4. Projectile visibility is delayed by `startupFrames`.
+5. Both client and server use `shared/projectileSim.js` to derive when the
+   projectile spawns and where it is at tick `T`.
+6. Server remains authoritative for hit detection, damage, knockback, and
+   move validity.
+
+This is intentionally not full projectile state replication. Projectile
+motion is deterministic from shared config; outcomes are authoritative.
+
 ### Player state contract
 
 Player objects in gameState.players maps include all stats from the character
@@ -184,7 +268,10 @@ definition (no fallbacks anywhere). Key fields:
   isJumping, isCrouching, verticalVelocity,
 
   // Combat state
-  isPunching, isKicking, attackState, hitStun, knockbackVelocity,
+  isPunching, isKicking, isRangedAttacking,
+  attackState, attackStartTick,
+  projectileSpawnX, projectileSpawnHeight,
+  hitStun, knockbackVelocity,
 
   // Character stats (copied from shared/Characters.js at selection time)
   characterWidth, characterHeight, movementSpeed, jumpVelocity,
@@ -195,14 +282,21 @@ definition (no fallbacks anywhere). Key fields:
   // Hitbox dimensions (for combat collision detection)
   armWidth, armHeight, armYOffset,
   legWidth, legHeight, legYOffset,
+  rangedAttack,
+  visual,
 
   // Input/tick tracking
   inputBuffer: { [serverTick]: keyState },
+  comboState, previousInput,
   currentFrame, serverTick, lastProcessedTick
 }
 
 Important: The server pulls one entry per tick from player.inputBuffer, keyed
 by serverTick. Input frames are decoded from bitmasks using `shared/inputFlags.js`.
+
+Important: combo recognition is tick-history based, not packet-boundary based.
+The client sends input in batches every 3 frames, but combo logic operates on
+the decomposed per-tick frames after decode/storage in `inputBuffer`.
 
 When adding new input controls:
 1. Add to INPUT_FLAGS in `shared/inputFlags.js`
@@ -214,6 +308,13 @@ When adding new action states (visible to other players):
 2. Update decodeActionMask/encodeActionMask in stateCodec.js
 3. Add explicit mapping in GameLoopService.js broadcast (the players.map() block)
 4. Handle in client's GameLoop.js for remote player state sync
+
+When changing ranged projectile behavior:
+1. Update per-character `rangedAttack` config in `shared/Characters.js`
+2. Keep startup/flight logic in `shared/projectileSim.js`
+3. Update server hit logic in `GameLoopService.getAttackHitbox()`
+4. Update client rendering in `Draw.DrawRangedAttack()`
+5. Preserve deterministic parity between server and client math
 
 ### Rooms and lifecycle
 
@@ -240,6 +341,9 @@ When adding new action states (visible to other players):
 - When introducing new combat actions, update the server's
   handlePlayerInput + updatePlayerState and the client's prediction code
   (simulatePlayerMovementFrame and renderers) in lockstep.
+- Multiplayer ranged visuals should wait for authoritative ranged start
+  metadata from the server before showing the actual projectile. Local-only
+  sandboxes like `AnimationTest` can simulate the projectile immediately.
 - **Monotonic serverTick**: `serverTick` never resets between rounds within a
   match — only on a true rematch. `GameLoopService.start()` recalibrates
   `matchStartTime` on round 2+ so the wall-clock formula
@@ -250,6 +354,32 @@ When adding new action states (visible to other players):
   interval. If the server falls behind under load, excess ticks are skipped
   by advancing `serverTick` rather than processing a burst. This prevents
   runaway catch-up spikes.
+
+## Current Roadmap
+
+Near-term recommended follow-up work:
+
+1. Tune melee and ranged timings in `shared/Characters.js`
+   - Startup frames, travel frames, projectile speed, damage, and knockback
+   should be adjusted by feel in `TrainingGrounds` before broader expansion.
+
+2. Improve attack readability in `react-fighter/src/game-engine/Draw.js`
+   - Add clearer anticipation, recoil, hit reactions, and per-class attack
+   poses so melee and ranged moves read faster.
+
+3. Expand deterministic projectile behavior carefully
+   - If needed later, add projectile clash, block/parry interactions, or
+   multi-hit logic, but keep projectile motion derived from shared math rather
+   than per-tick replication.
+
+4. Prepare for sprite-sheet migration
+   - Keep the current `visual` schema stable and move toward a render pipeline
+   of `player state -> animation state -> render output`, so procedural canvas
+   art can later be swapped for authored 2D assets.
+
+5. Run an actual multiplayer feel pass
+   - Validate that ranged startup feels responsive enough over the network and
+   that local windup plus authoritative projectile spawn does not feel late.
 
 ### Round and match lifecycle
 
