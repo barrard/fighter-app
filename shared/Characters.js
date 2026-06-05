@@ -61,10 +61,11 @@ export const BASE_STATS = {
     },
 };
 
-const createCharacter = (id, name, color, stats = {}) => ({
+const createCharacter = (id, name, color, stats = {}, spriteCharacter = null) => ({
     id,
     name,
     color,
+    spriteCharacter,
     stats: {
         ...BASE_STATS,
         ...stats,
@@ -92,7 +93,7 @@ const CHARACTERS = [
             accessory: "pauldron",
             weapon: "sword",
         },
-    }),
+    }, 'bear'),
     createCharacter(2, "Mage", "#7c3aed", {
         width: 46,
         height: 104,
@@ -128,7 +129,7 @@ const CHARACTERS = [
             accessory: "glow",
             weapon: "staff",
         },
-    }),
+    }, 'bear'),
     createCharacter(3, "Archer", "#16a34a", {
         width: 48,
         height: 102,
@@ -164,7 +165,7 @@ const CHARACTERS = [
             accessory: "quiver",
             weapon: "bow",
         },
-    }),
+    }, 'bear'),
     createCharacter(4, "Rogue", "#475569", {
         width: 44,
         height: 98,
@@ -200,7 +201,7 @@ const CHARACTERS = [
             accessory: "mask",
             weapon: "dagger",
         },
-    }),
+    }, 'bear'),
     createCharacter(5, "Berserker", "#dc2626", {
         width: 58,
         height: 110,
@@ -220,7 +221,7 @@ const CHARACTERS = [
             accessory: "fur",
             weapon: "axe",
         },
-    }),
+    }, 'bear'),
     createCharacter(6, "Monk", "#ea580c", {
         width: 46,
         height: 100,
@@ -244,7 +245,7 @@ const CHARACTERS = [
             accessory: "sash",
             weapon: "beads",
         },
-    }),
+    }, 'bear'),
 ];
 
 export default CHARACTERS;
