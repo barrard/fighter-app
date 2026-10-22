@@ -7,7 +7,7 @@ export const ARENAS = [
     {
         id: "street",
         name: "Street",
-        backgroundUrl: "/arenas/street_blender.png",
+        backgroundUrl: "/arenas/street_blender.webp",
         worldWidth: 1728,
         floorYRatio: 0.87,
     },
